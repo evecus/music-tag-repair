@@ -196,12 +196,16 @@ class RepairEngine(
                 MusicSource.QQ -> info.coverUrl
                 else -> info.coverUrl
             }
-            if (coverUrl != null) {
+            if (coverUrl == null) {
+                Log.w(TAG, "Cover URL is null (${info.sourceId}), name=${info.name}")
+            } else {
                 val coverData = onlineService.downloadCover(coverUrl)
                 if (coverData != null) {
                     tags.coverData = coverData
                     tags.coverMime = "image/jpeg"
                     tags.hasCover = true
+                } else {
+                    Log.w(TAG, "Cover download failed (${info.sourceId}), url=$coverUrl")
                 }
             }
         }.onFailure { Log.w(TAG, "Get cover failed (${info.sourceId}): ${it.message}") }

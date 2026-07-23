@@ -35,6 +35,8 @@ class OnlineService(
     private val client: OkHttpClient get() = httpClient
 
     companion object {
+        private const val TAG = "OnlineService"
+
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
@@ -273,7 +275,10 @@ class OnlineService(
     suspend fun getKuGouCover(info: OnlineMusicInfo): String? = withContext(Dispatchers.IO) {
         try {
             val hash = info.meta["hash"].orEmpty()
-            if (hash.isBlank()) return@withContext null
+            if (hash.isBlank()) {
+                android.util.Log.w(TAG, "getKuGouCover: hash 为空，跳过")
+                return@withContext null
+            }
             // album_audio_id 应使用 MixSongID（对应 meta.albumAudioId），而不是 Audioid（meta.musicId）。
             // 之前误用 musicId 会导致 get_res_privilege 查不到封面，这里做修正并保留 musicId 作为兜底。
             val albumAudioId = info.meta["albumAudioId"].orEmpty()
@@ -312,22 +317,43 @@ class OnlineService(
                 .build()
 
             val resp = client.newCall(request).execute()
-            val respBody = resp.body?.string() ?: return@withContext null
+            if (!resp.isSuccessful) {
+                android.util.Log.w(TAG, "getKuGouCover: HTTP ${resp.code}，hash=$hash")
+                return@withContext null
+            }
+            val respBody = resp.body?.string()
+            if (respBody.isNullOrBlank()) {
+                android.util.Log.w(TAG, "getKuGouCover: 响应体为空，hash=$hash")
+                return@withContext null
+            }
             val root = json.parseToJsonElement(respBody).jsonObject
-            val data = root["data"]?.jsonArray ?: return@withContext null
-            if (data.isEmpty()) return@withContext null
+            val data = root["data"]?.jsonArray
+            if (data == null || data.isEmpty()) {
+                android.util.Log.w(TAG, "getKuGouCover: data 为空。原始响应：$respBody")
+                return@withContext null
+            }
 
-            val infoObj = data[0].jsonObject["info"]?.jsonObject ?: return@withContext null
-            val image = infoObj["image"]?.stringOrNull() ?: return@withContext null
+            val infoObj = data[0].jsonObject["info"]?.jsonObject
+            if (infoObj == null) {
+                android.util.Log.w(TAG, "getKuGouCover: info 字段缺失。data[0]=${data[0]}")
+                return@withContext null
+            }
+            val image = infoObj["image"]?.stringOrNull()
+            if (image.isNullOrBlank()) {
+                android.util.Log.w(TAG, "getKuGouCover: image 字段为空。infoObj=$infoObj")
+                return@withContext null
+            }
             val imgSizes = infoObj["imgsize"]?.jsonArray
-            if (imgSizes != null && imgSizes.isNotEmpty()) {
+            val finalUrl = if (imgSizes != null && imgSizes.isNotEmpty()) {
                 val size = imgSizes[0].stringOrNull()
                 if (size != null && image.contains("{size}")) {
-                    return@withContext image.replace("{size}", size)
-                }
-            }
-            image
-        } catch (_: Throwable) {
+                    image.replace("{size}", size)
+                } else image
+            } else image
+            android.util.Log.d(TAG, "getKuGouCover: 成功，url=$finalUrl")
+            finalUrl
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "getKuGouCover: 异常 ${e.javaClass.simpleName}: ${e.message}", e)
             null
         }
     }
@@ -484,10 +510,26 @@ class OnlineService(
      */
     suspend fun downloadCover(url: String): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            val request = Request.Builder().url(url).header("User-Agent", UA).get().build()
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", UA)
+                .header("Referer", "https://www.kugou.com/")
+                .get()
+                .build()
             val resp = client.newCall(request).execute()
-            if (resp.isSuccessful) resp.body?.bytes() else null
-        } catch (_: Throwable) {
+            if (!resp.isSuccessful) {
+                android.util.Log.w(TAG, "downloadCover: HTTP ${resp.code}，url=$url")
+                return@withContext null
+            }
+            val bytes = resp.body?.bytes()
+            if (bytes == null || bytes.isEmpty()) {
+                android.util.Log.w(TAG, "downloadCover: 响应体为空，url=$url")
+                return@withContext null
+            }
+            android.util.Log.d(TAG, "downloadCover: 成功，${bytes.size} bytes，url=$url")
+            bytes
+        } catch (e: Throwable) {
+            android.util.Log.e(TAG, "downloadCover: 异常 ${e.javaClass.simpleName}: ${e.message}，url=$url", e)
             null
         }
     }
