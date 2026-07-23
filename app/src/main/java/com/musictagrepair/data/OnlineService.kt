@@ -126,8 +126,10 @@ class OnlineService(
      * 除了基础信息外还能拿到 [Audioid] / [AlbumID] / [FileHash] / [Duration]，这些字段后续用于歌词和封面接口。
      * 关键字段写入 [OnlineMusicInfo.meta]：
      * - `hash`：FileHash，歌词搜索和封面接口都需要
-     * - `musicId`：Audioid 字符串
+     * - `musicId`：Audioid 字符串（歌曲 ID，非封面接口用）
      * - `albumId`：AlbumID
+     * - `albumAudioId`：MixSongID，封面接口 get_res_privilege 的 album_audio_id 需要用这个，
+     *   不能用 Audioid（两者是不同字段，之前混用导致取不到封面，参考 any-listen 的实现修正）
      * - `_interval`：Duration（秒），传给歌词接口的 timelength
      */
     suspend fun searchKuGou(keyword: String, page: Int = 1, limit: Int = 10): List<OnlineMusicInfo> = withContext(Dispatchers.IO) {
@@ -153,6 +155,9 @@ class OnlineService(
 
                 val musicId = obj["Audioid"]?.intOrNull()?.toString().orEmpty()
                 val albumId = obj["AlbumID"]?.stringOrNull().orEmpty()
+                // 封面接口 get_res_privilege 的 album_audio_id 需要 MixSongID，不是 Audioid，
+                // 两者是不同字段，混用会导致酷狗接口查不到图片（参考 any-listen musicSearch.ts）
+                val albumAudioId = obj["MixSongID"]?.stringOrNull().orEmpty()
                 val duration = obj["Duration"]?.longOrNull() ?: 0L
                 val interval = if (duration > 0) formatInterval(duration * 1000) else null
 
@@ -171,6 +176,7 @@ class OnlineService(
                         "hash" to hash,
                         "musicId" to musicId,
                         "albumId" to albumId,
+                        "albumAudioId" to albumAudioId,
                         "_interval" to duration.toString(),
                     ),
                 )
@@ -262,13 +268,17 @@ class OnlineService(
      * POST `media.store.kugou.com/v1/get_res_privilege`，传入 hash / album_audio_id / album_id 拿到图片地址。
      * 返回的 image 模板含 `{size}` 占位符，会被 [imgsize] 数组的第一个值替换。
      *
-     * @param info 来自 [searchKuGou] 的搜索结果，[OnlineMusicInfo.meta] 必须含 `hash`，可选 `musicId`/`albumId`
+     * @param info 来自 [searchKuGou] 的搜索结果，[OnlineMusicInfo.meta] 必须含 `hash`，可选 `albumAudioId`/`albumId`
      */
     suspend fun getKuGouCover(info: OnlineMusicInfo): String? = withContext(Dispatchers.IO) {
         try {
             val hash = info.meta["hash"].orEmpty()
             if (hash.isBlank()) return@withContext null
-            val albumAudioId = info.meta["musicId"].orEmpty().ifBlank { "0" }
+            // album_audio_id 应使用 MixSongID（对应 meta.albumAudioId），而不是 Audioid（meta.musicId）。
+            // 之前误用 musicId 会导致 get_res_privilege 查不到封面，这里做修正并保留 musicId 作为兜底。
+            val albumAudioId = info.meta["albumAudioId"].orEmpty()
+                .ifBlank { info.meta["musicId"].orEmpty() }
+                .ifBlank { "0" }
             val albumId = info.meta["albumId"].orEmpty().ifBlank { "0" }
 
             val jsonBody = buildJsonObject {
