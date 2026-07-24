@@ -100,7 +100,10 @@ class RepairEngine(
      * - 仅有标题 → 标题
      * - 都没有 → 文件名（去掉括号注释和扩展名）
      *
-     * 排序策略：标题精确匹配 > 歌手匹配 > 专辑匹配 > 其他
+     * 排序策略：见 [relevanceScore]（匹配精确度优先，其次信息完整度）。
+     *
+     * 过滤策略：标题、歌手必须**都**匹配（模糊或精确均可）才保留，见 [titleMatchScore] / [artistMatchScore]；
+     * 只要有一项完全不沾边，就从列表中剔除，避免"匹配在线信息"里出现风马牛不相及的歌曲。
      */
     suspend fun searchOnline(fileStatus: FileStatus): List<OnlineMusicInfo> = coroutineScope {
         val tags = fileStatus.report.currentTags
@@ -122,18 +125,89 @@ class RepairEngine(
             async { runCatching { qqMusicService.search(keyword) }.getOrDefault(emptyList()) },
         )
 
-        val results = deferreds.awaitAll().flatten()
+        val rawResults = deferreds.awaitAll().flatten()
+        val hasLocalTitle = !tags.title.isNullOrBlank()
+        val hasLocalArtist = !tags.artist.isNullOrBlank()
 
-        // 排序：标题完全匹配 > 歌手包含 > 专辑包含 > 其他
-        val titleLower = tags.title?.lowercase().orEmpty()
-        val artistLower = tags.artist?.lowercase().orEmpty()
-        results.sortedWith(
-            compareByDescending<OnlineMusicInfo> { it.name.equals(tags.title ?: it.name, ignoreCase = true) }
-                .thenByDescending { artistLower.isNotBlank() && it.singer.contains(artistLower, ignoreCase = true) }
-                .thenByDescending { it.singer.isNotBlank() && artistLower.contains(it.singer.substringBefore("、").lowercase(), ignoreCase = true) }
-                .thenBy { it.sourceId },
-        )
+        // 过滤：标题、歌手必须都匹配（本地缺失的那一项不参与过滤）
+        val filtered = if (!hasLocalTitle && !hasLocalArtist) {
+            // 本地没有可用标题/歌手作为参照（用文件名兜底搜索），无法判断相关性，不过滤
+            rawResults
+        } else {
+            rawResults.filter { info ->
+                val titleOk = !hasLocalTitle || titleMatchScore(info.name, tags.title!!) > 0.0
+                val artistOk = !hasLocalArtist || artistMatchScore(info.singer, tags.artist!!) > 0.0
+                titleOk && artistOk
+            }
+        }
+
+        // 排序：匹配精确度优先，其次信息完整度（专辑/封面/时长等字段是否齐全）
+        filtered.sortedByDescending { relevanceScore(it, tags.title, tags.artist) }
     }
+
+    /**
+     * 综合评分，用于排序：匹配精确度权重远高于信息完整度，
+     * 即"越精确匹配的越靠前"，同等匹配精确度下"信息越全的越靠前"。
+     */
+    private fun relevanceScore(info: OnlineMusicInfo, localTitle: String?, localArtist: String?): Double {
+        val titleScore = if (localTitle.isNullOrBlank()) 0.5 else titleMatchScore(info.name, localTitle)
+        val artistScore = if (localArtist.isNullOrBlank()) 0.5 else artistMatchScore(info.singer, localArtist)
+        // 匹配精确度（0~1，二者各占一半），放大到 0~1000 作为主排序依据
+        val matchScore = (titleScore + artistScore) / 2.0 * 1000.0
+
+        // 信息完整度：专辑、封面、时长、歌手信息是否存在，每项加一点分，作为同精确度下的次级排序依据
+        var completeness = 0.0
+        if (info.album.isNotBlank()) completeness += 1.0
+        if (!info.coverUrl.isNullOrBlank()) completeness += 1.0
+        if (!info.interval.isNullOrBlank()) completeness += 1.0
+        if (info.singer.isNotBlank()) completeness += 1.0
+        if (!info.lyrics.isNullOrBlank()) completeness += 1.0
+
+        return matchScore + completeness
+    }
+
+    /**
+     * 标题匹配度：0（完全不相关）~ 1（完全一致）。
+     * - 完全一致（归一化后）：1.0
+     * - 互相包含（如本地"Faded"命中线上"Faded (Restrung)"）：0.7
+     * - 完全不沾边：0.0
+     */
+    private fun titleMatchScore(remoteTitle: String, localTitle: String): Double {
+        val remote = normalizeForMatch(remoteTitle)
+        val local = normalizeForMatch(localTitle)
+        if (local.isBlank() || remote.isBlank()) return 0.0
+        if (remote == local) return 1.0
+        if (remote.contains(local) || local.contains(remote)) return 0.7
+        return 0.0
+    }
+
+    /**
+     * 歌手匹配度：0（完全不相关）~ 1（完全一致）。
+     * 线上歌手字段可能是"歌手A、歌手B"多人形式，逐个拆分后取最高分。
+     */
+    private fun artistMatchScore(remoteSinger: String, localArtist: String): Double {
+        val local = normalizeForMatch(localArtist)
+        if (local.isBlank()) return 0.0
+        val remoteArtists = remoteSinger
+            .split("、", "/", ",", "，", "&")
+            .map { normalizeForMatch(it) }
+            .filter { it.isNotBlank() }
+        if (remoteArtists.isEmpty()) return 0.0
+        return remoteArtists.maxOf { remote ->
+            when {
+                remote == local -> 1.0
+                remote.contains(local) || local.contains(remote) -> 0.7
+                else -> 0.0
+            }
+        }
+    }
+
+    /** 归一化：去除括号注释、空白、常见标点，转小写，便于模糊比较。 */
+    private fun normalizeForMatch(s: String): String = s
+        .lowercase()
+        .replace(Regex("[\\(\\[（【].*?[\\)\\]）】]"), "")
+        .replace(Regex("[\\s\\-_·.,，。！?？!]"), "")
+        .trim()
 
     /**
      * 获取完整元数据（在线歌曲 → 歌词 + 封面）。
