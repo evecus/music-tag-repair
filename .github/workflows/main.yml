@@ -34,17 +34,11 @@ jobs:
           mkdir -p out
           cp app/build/outputs/apk/debug/*.apk out/music-tag-repair-debug.apk
 
-      - name: Move tag "test" to current commit
-        run: |
-          git tag -f test
-          git push origin test --force
-
-      # 用固定 tag "test" 发布/更新一个 prerelease，每次手动运行都会覆盖它
       - name: Publish prerelease
         uses: softprops/action-gh-release@v2
         with:
           tag_name: test
-          name: PasswordStore test
+          name: music-tag-repair test
           prerelease: true
           make_latest: false
           files: out/music-tag-repair-debug.apk
