@@ -124,7 +124,7 @@ data class FileStatus(
  *
  * [meta] 用于保存各平台后续获取歌词/封面所需的字段：
  * - wy（网易云）：id 即歌曲 id，直接用于歌词/封面接口
- * - kg（酷狗）：id 即 hash，直接用于歌词/封面接口
+ * - kg（酷狗）：id 即 hash，直接用于歌词/封面接口；meta 额外存 musicId / albumId / albumAudioId / imgUrl（搜索 Image 字段，封面兜底）/ _interval
  * - kw（酷我）：id 即 MUSICRID 去掉前缀的 rid
  * - mg（咪咕）：id 是 songId；meta 额外存 contentId / copyrightId / lrcUrl / mrcUrl / trcUrl / picUrl
  * - tx（QQ）：id 是 song mid；meta 额外存 songId（数字 id，用于歌词接口）/ albumMid（用于封面拼 URL）
