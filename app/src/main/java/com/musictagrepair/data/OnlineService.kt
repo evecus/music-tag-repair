@@ -128,10 +128,10 @@ class OnlineService(
      * 除了基础信息外还能拿到 [Audioid] / [AlbumID] / [FileHash] / [Duration]，这些字段后续用于歌词和封面接口。
      * 关键字段写入 [OnlineMusicInfo.meta]：
      * - `hash`：FileHash，歌词搜索和封面接口都需要
-     * - `musicId`：Audioid 字符串（歌曲 ID，非封面接口用）
+     * - `musicId`：Audioid 字符串（歌曲 ID），封面接口 album_audio_id 优先使用（参考 any-listen pic.ts）
      * - `albumId`：AlbumID
-     * - `albumAudioId`：MixSongID，封面接口 get_res_privilege 的 album_audio_id 需要用这个，
-     *   不能用 Audioid（两者是不同字段，之前混用导致取不到封面，参考 any-listen 的实现修正）
+     * - `albumAudioId`：MixSongID，作为 album_audio_id 的兜底
+     * - `imgUrl`：搜索接口返回的 Image 字段（含 {size} 占位符），作为 getKuGouCover 的兜底封面 URL
      * - `_interval`：Duration（秒），传给歌词接口的 timelength
      */
     suspend fun searchKuGou(keyword: String, page: Int = 1, limit: Int = 10): List<OnlineMusicInfo> = withContext(Dispatchers.IO) {
@@ -157,8 +157,6 @@ class OnlineService(
 
                 val musicId = obj["Audioid"]?.intOrNull()?.toString().orEmpty()
                 val albumId = obj["AlbumID"]?.stringOrNull().orEmpty()
-                // 封面接口 get_res_privilege 的 album_audio_id 需要 MixSongID，不是 Audioid，
-                // 两者是不同字段，混用会导致酷狗接口查不到图片（参考 any-listen musicSearch.ts）
                 val albumAudioId = obj["MixSongID"]?.stringOrNull().orEmpty()
                 val duration = obj["Duration"]?.longOrNull() ?: 0L
                 val interval = if (duration > 0) formatInterval(duration * 1000) else null
@@ -166,6 +164,9 @@ class OnlineService(
                 val singers = obj["Singers"]?.jsonArray?.mapNotNull { it.jsonObject["name"]?.stringOrNull()?.takeIf { n -> n.isNotBlank() } }?.joinToString("、").orEmpty()
                 val songName = obj["OriSongName"]?.stringOrNull().orEmpty()
                 val albumName = obj["AlbumName"]?.stringOrNull().orEmpty()
+                // 搜索接口已返回 Image 字段（含 {size} 占位符的封面 URL），
+                // 存入 meta 作为 getKuGouCover 的兜底：当 get_res_privilege 接口异常时仍能取到封面。
+                val imgUrl = obj["Image"]?.stringOrNull().orEmpty()
 
                 OnlineMusicInfo(
                     id = hash,
@@ -179,6 +180,7 @@ class OnlineService(
                         "musicId" to musicId,
                         "albumId" to albumId,
                         "albumAudioId" to albumAudioId,
+                        "imgUrl" to imgUrl,
                         "_interval" to duration.toString(),
                     ),
                 )
@@ -268,94 +270,117 @@ class OnlineService(
      * 获取酷狗封面 URL。
      *
      * POST `media.store.kugou.com/v1/get_res_privilege`，传入 hash / album_audio_id / album_id 拿到图片地址。
-     * 返回的 image 模板含 `{size}` 占位符，会被 [imgsize] 数组的第一个值替换。
+     * 返回的 image 模板含 `{size}` 占位符，会被 imgsize 数组的第一个值替换。
      *
-     * @param info 来自 [searchKuGou] 的搜索结果，[OnlineMusicInfo.meta] 必须含 `hash`，可选 `albumAudioId`/`albumId`
+     * 兜底策略：若 get_res_privilege 接口异常或未返回 image，则使用 [searchKuGou] 存入 `meta.imgUrl` 的
+     * 搜索接口 Image 字段（同样含 {size} 占位符），用默认尺寸 480 替换后返回，确保封面总能取到。
+     *
+     * @param info 来自 [searchKuGou] 的搜索结果，[OnlineMusicInfo.meta] 必须含 `hash`，
+     *             可选 `musicId`/`albumAudioId`/`albumId`/`imgUrl`
      */
     suspend fun getKuGouCover(info: OnlineMusicInfo): String? = withContext(Dispatchers.IO) {
-        try {
-            val hash = info.meta["hash"].orEmpty()
-            if (hash.isBlank()) {
-                android.util.Log.w(TAG, "getKuGouCover: hash 为空，跳过")
-                return@withContext null
-            }
-            // album_audio_id 应使用 MixSongID（对应 meta.albumAudioId），而不是 Audioid（meta.musicId）。
-            // 之前误用 musicId 会导致 get_res_privilege 查不到封面，这里做修正并保留 musicId 作为兜底。
-            val albumAudioId = info.meta["albumAudioId"].orEmpty()
-                .ifBlank { info.meta["musicId"].orEmpty() }
-                .ifBlank { "0" }
-            val albumId = info.meta["albumId"].orEmpty().ifBlank { "0" }
+        val hash = info.meta["hash"].orEmpty()
+        // album_audio_id 优先使用 musicId（Audioid），与 any-listen pic.ts 实现一致；
+        // albumAudioId（MixSongID）作为兜底。实测两者均可，这里以参考实现为准。
+        val albumAudioId = info.meta["musicId"].orEmpty()
+            .ifBlank { info.meta["albumAudioId"].orEmpty() }
+            .ifBlank { "0" }
+        val albumId = info.meta["albumId"].orEmpty().ifBlank { "0" }
 
-            val jsonBody = buildJsonObject {
-                put("appid", 1001)
-                put("area_code", "1")
-                put("behavior", "play")
-                put("clientver", "9020")
-                put("need_hash_offset", 1)
-                put("relate", 1)
-                put("resource", buildJsonArray {
-                    add(buildJsonObject {
-                        put("album_audio_id", albumAudioId)
-                        put("album_id", albumId)
-                        put("hash", hash)
-                        put("id", 0)
-                        put("name", "${info.singer} - ${info.name}.mp3")
-                        put("type", "audio")
-                    })
-                })
-                put("token", "")
-                put("userid", 2626431536)
-                put("vip", 1)
-            }.toString()
-            val body = jsonBody.toRequestBody(JSON_MEDIA_TYPE)
-            val request = Request.Builder()
-                .url("http://media.store.kugou.com/v1/get_res_privilege")
-                .header("KG-RC", "1")
-                .header("KG-THash", "expand_search_manager.cpp:852736169:451")
-                .header("User-Agent", "KuGou2012-9020-ExpandSearchManager")
-                .post(body)
-                .build()
+        // 主路径：调用 get_res_privilege 获取封面
+        val apiCover = runCatching {
+            if (hash.isBlank()) return@runCatching null
+            fetchKugouCoverFromApi(hash, albumAudioId, albumId, info)
+        }.onFailure { e ->
+            android.util.Log.w(TAG, "getKuGouCover: get_res_privilege 异常 ${e.javaClass.simpleName}: ${e.message}")
+        }.getOrNull()
 
-            val resp = client.newCall(request).execute()
-            if (!resp.isSuccessful) {
-                android.util.Log.w(TAG, "getKuGouCover: HTTP ${resp.code}，hash=$hash")
-                return@withContext null
-            }
-            val respBody = resp.body?.string()
-            if (respBody.isNullOrBlank()) {
-                android.util.Log.w(TAG, "getKuGouCover: 响应体为空，hash=$hash")
-                return@withContext null
-            }
-            val root = json.parseToJsonElement(respBody).jsonObject
-            val data = root["data"]?.jsonArray
-            if (data == null || data.isEmpty()) {
-                android.util.Log.w(TAG, "getKuGouCover: data 为空。原始响应：$respBody")
-                return@withContext null
-            }
+        if (!apiCover.isNullOrBlank()) {
+            android.util.Log.d(TAG, "getKuGouCover: 成功（API），url=$apiCover")
+            return@withContext apiCover
+        }
 
-            val infoObj = data[0].jsonObject["info"]?.jsonObject
-            if (infoObj == null) {
-                android.util.Log.w(TAG, "getKuGouCover: info 字段缺失。data[0]=${data[0]}")
-                return@withContext null
-            }
-            val image = infoObj["image"]?.stringOrNull()
-            if (image.isNullOrBlank()) {
-                android.util.Log.w(TAG, "getKuGouCover: image 字段为空。infoObj=$infoObj")
-                return@withContext null
-            }
-            val imgSizes = infoObj["imgsize"]?.jsonArray
-            val finalUrl = if (imgSizes != null && imgSizes.isNotEmpty()) {
-                val size = imgSizes[0].stringOrNull()
-                if (size != null && image.contains("{size}")) {
-                    image.replace("{size}", size)
-                } else image
-            } else image
-            android.util.Log.d(TAG, "getKuGouCover: 成功，url=$finalUrl")
-            finalUrl
-        } catch (e: Throwable) {
-            android.util.Log.e(TAG, "getKuGouCover: 异常 ${e.javaClass.simpleName}: ${e.message}", e)
+        // 兜底：使用搜索接口返回的 Image 字段
+        val fallback = resolveKugouCoverSize(info.meta["imgUrl"].orEmpty())
+        if (fallback.isNotBlank()) {
+            android.util.Log.d(TAG, "getKuGouCover: 使用搜索 Image 兜底，url=$fallback")
+            fallback
+        } else {
+            android.util.Log.w(TAG, "getKuGouCover: 无可用封面，hash=$hash")
             null
         }
+    }
+
+    /**
+     * 调用 get_res_privilege 接口获取封面 URL。
+     * 返回的 image 含 `{size}` 占位符，用 imgsize 数组首个元素替换；imgsize 缺失时用默认值 480。
+     */
+    private fun fetchKugouCoverFromApi(
+        hash: String, albumAudioId: String, albumId: String, info: OnlineMusicInfo,
+    ): String? {
+        val jsonBody = buildJsonObject {
+            put("appid", 1001)
+            put("area_code", "1")
+            put("behavior", "play")
+            put("clientver", "9020")
+            put("need_hash_offset", 1)
+            put("relate", 1)
+            put("resource", buildJsonArray {
+                add(buildJsonObject {
+                    put("album_audio_id", albumAudioId)
+                    put("album_id", albumId)
+                    put("hash", hash)
+                    put("id", 0)
+                    put("name", "${info.singer} - ${info.name}.mp3")
+                    put("type", "audio")
+                })
+            })
+            put("token", "")
+            put("userid", 2626431536)
+            put("vip", 1)
+        }.toString()
+        val body = jsonBody.toRequestBody(JSON_MEDIA_TYPE)
+        val request = Request.Builder()
+            .url("http://media.store.kugou.com/v1/get_res_privilege")
+            .header("KG-RC", "1")
+            .header("KG-THash", "expand_search_manager.cpp:852736169:451")
+            .header("User-Agent", "KuGou2012-9020-ExpandSearchManager")
+            .post(body)
+            .build()
+
+        val resp = client.newCall(request).execute()
+        if (!resp.isSuccessful) {
+            android.util.Log.w(TAG, "fetchKugouCoverFromApi: HTTP ${resp.code}，hash=$hash")
+            return null
+        }
+        val respBody = resp.body?.string()
+        if (respBody.isNullOrBlank()) return null
+        val root = json.parseToJsonElement(respBody).jsonObject
+        val data = root["data"]?.jsonArray
+        if (data.isNullOrEmpty()) {
+            android.util.Log.w(TAG, "fetchKugouCoverFromApi: data 为空。响应：$respBody")
+            return null
+        }
+        val infoObj = data[0].jsonObject["info"]?.jsonObject
+        val image = infoObj?.get("image")?.stringOrNull()
+        if (image.isNullOrBlank()) return null
+
+        // imgsize 元素是数字（如 [480, 400, ...]），stringOrNull() 对 JsonPrimitive 数字
+        // 会返回其 content（即 "480"），无需额外 int/long 转换。
+        val imgSizes = infoObj["imgsize"]?.jsonArray
+        return resolveKugouCoverSize(image, imgSizes)
+    }
+
+    /**
+     * 替换酷狗封面 URL 中的 `{size}` 占位符。
+     * - 有 imgsize 数组时取首个元素的字符串值；
+     * - 无 imgsize 时用默认尺寸 "480"（酷狗标准最大缩略图尺寸）；
+     * - URL 不含 `{size}` 时原样返回。
+     */
+    private fun resolveKugouCoverSize(url: String, imgSizes: JsonArray? = null): String {
+        if (url.isBlank() || !url.contains("{size}")) return url
+        val size = imgSizes?.firstOrNull()?.stringOrNull() ?: "480"
+        return url.replace("{size}", size)
     }
 
     /**
